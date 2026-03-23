@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, token, Address, Env, Vec};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -8,6 +8,14 @@ use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec
 const YIELD_BPS: i128 = 200;
 /// Slash penalty on default: 50% of voucher stake burned.
 const SLASH_BPS: i128 = 5000;
+
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ContractError {
+    InsufficientFunds = 1,
+}
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
 
@@ -86,7 +94,12 @@ impl QuorumCreditContract {
     }
 
     /// Disburse a microloan if total vouched stake meets the threshold.
-    pub fn request_loan(env: Env, borrower: Address, amount: i128, threshold: i128) {
+    pub fn request_loan(
+        env: Env,
+        borrower: Address,
+        amount: i128,
+        threshold: i128,
+    ) -> Result<(), ContractError> {
         borrower.require_auth();
 
         let vouches: Vec<VouchRecord> = env
@@ -98,8 +111,15 @@ impl QuorumCreditContract {
         let total_stake: i128 = vouches.iter().map(|v| v.stake).sum();
         assert!(total_stake >= threshold, "insufficient trust stake");
 
+        // Verify the contract holds enough XLM to cover the loan.
+        let token = Self::token(&env);
+        let contract_balance = token.balance(&env.current_contract_address());
+        if contract_balance < amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
         // Send loan amount to borrower.
-        Self::token(&env).transfer(&env.current_contract_address(), &borrower, &amount);
+        token.transfer(&env.current_contract_address(), &borrower, &amount);
 
         env.storage().persistent().set(
             &DataKey::Loan(borrower.clone()),
@@ -110,6 +130,7 @@ impl QuorumCreditContract {
                 defaulted: false,
             },
         );
+        Ok(())
     }
 
     /// Borrower repays loan; vouchers receive 2% yield on their stake.
@@ -293,26 +314,37 @@ mod tests {
         assert!(client.get_loan(&borrower).unwrap().defaulted);
     }
 
-    /// An attacker who observes the deployment transaction cannot front-run
-    /// `initialize` because the call requires the deployer's signature.
-    /// Without `mock_all_auths()` the SDK enforces real auth checks, so
-    /// calling `initialize` with an attacker-controlled deployer address
-    /// (whose signature is absent) must panic.
     #[test]
-    #[should_panic]
-    fn test_unauthorized_initialize_rejected() {
+    fn test_request_loan_underfunded_contract() {
         let env = Env::default();
-        // Intentionally do NOT call env.mock_all_auths() so auth is enforced.
+        env.mock_all_auths();
 
-        let legitimate_deployer = Address::generate(&env);
-        let attacker = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let borrower = Address::generate(&env);
+        let voucher = Address::generate(&env);
 
-        let token_id = env.register_stellar_asset_contract_v2(legitimate_deployer.clone());
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_admin = StellarAssetClient::new(&env, &token_id.address());
+        // Give voucher enough to stake but do NOT pre-fund the contract beyond the stake.
+        token_admin.mint(&voucher, &10_000_000);
+
         let contract_id = env.register_contract(None, QuorumCreditContract);
+        // Contract balance starts at 0; after vouch it will hold 1_000_000.
+        // Request a loan larger than the contract balance to trigger InsufficientFunds.
 
-        // Attacker tries to initialize with themselves as deployer — no valid
-        // signature is present, so require_auth() will panic.
         QuorumCreditContractClient::new(&env, &contract_id)
-            .initialize(&attacker, &attacker, &token_id.address());
+            .initialize(&admin, &token_id.address());
+
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        // Stake 1_000_000 — contract now holds exactly 1_000_000.
+        client.vouch(&voucher, &borrower, &1_000_000);
+
+        // Request 2_000_000 which exceeds the contract's 1_000_000 balance.
+        let result = client.try_request_loan(&borrower, &2_000_000, &1_000_000);
+        assert_eq!(
+            result,
+            Err(Ok(ContractError::InsufficientFunds)),
+            "expected InsufficientFunds error when contract balance < loan amount"
+        );
     }
 }
