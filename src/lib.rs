@@ -101,6 +101,7 @@ impl QuorumCreditContract {
         threshold: i128,
     ) -> Result<(), ContractError> {
         borrower.require_auth();
+        assert!(threshold > 0, "threshold must be greater than zero");
 
         let vouches: Vec<VouchRecord> = env
             .storage()
@@ -227,7 +228,7 @@ impl QuorumCreditContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    fn token(env: &Env) -> token::Client {
+    fn token(env: &Env) -> token::Client<'_> {
         let addr: Address = env
             .storage()
             .instance()
@@ -315,6 +316,17 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "threshold must be greater than zero")]
+    fn test_zero_threshold_rejected() {
+        let env = Env::default();
+        let (contract_id, _token_addr, _admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.request_loan(&borrower, &500_000, &0);
+    }
+
+    #[test]
     fn test_request_loan_underfunded_contract() {
         let env = Env::default();
         env.mock_all_auths();
@@ -333,7 +345,7 @@ mod tests {
         // Request a loan larger than the contract balance to trigger InsufficientFunds.
 
         QuorumCreditContractClient::new(&env, &contract_id)
-            .initialize(&admin, &token_id.address());
+            .initialize(&admin, &admin, &token_id.address());
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
