@@ -530,6 +530,17 @@ impl QuorumCreditContract {
 
     // ── Views ─────────────────────────────────────────────────────────────────
 
+    pub fn is_initialized(env: Env) -> bool {
+        env.storage().instance().has(&DataKey::Admin)
+    }
+
+    pub fn get_token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("not initialized")
+    }
+
     pub fn get_admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -614,11 +625,6 @@ mod tests {
         // Set max_loan_to_stake_ratio to 150% (150 * 100 = 15000 basis points)
         QuorumCreditContractClient::new(env, &contract_id)
             .initialize(&admin, &admin, &token_id.address(), &150);
-        QuorumCreditContractClient::new(env, &contract_id).initialize(
-            &admin,
-            &admin,
-            &token_id.address(),
-        );
 
         (contract_id, token_id.address(), admin, borrower, voucher)
     }
@@ -711,11 +717,6 @@ mod tests {
 
         QuorumCreditContractClient::new(&env, &contract_id)
             .initialize(&admin, &admin, &token_id.address(), &150);
-        QuorumCreditContractClient::new(&env, &contract_id).initialize(
-            &admin,
-            &admin,
-            &token_id.address(),
-        );
 
         let client = QuorumCreditContractClient::new(&env, &contract_id);
         // Stake 1_000_000 — contract now holds exactly 1_000_000.
@@ -1065,5 +1066,29 @@ mod tests {
         let client = QuorumCreditContractClient::new(&env, &contract_id);
 
         assert_eq!(client.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_is_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        assert!(!client.is_initialized());
+        client.initialize(&admin, &admin, &token_id.address(), &150);
+        assert!(client.is_initialized());
+    }
+
+    #[test]
+    fn test_get_token_returns_token_address() {
+        let env = Env::default();
+        let (contract_id, token_addr, _admin, _borrower, _voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+
+        assert_eq!(client.get_token(), token_addr);
     }
 }
