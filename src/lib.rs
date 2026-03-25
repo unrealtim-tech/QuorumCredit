@@ -928,6 +928,128 @@ impl QuorumCreditContract {
             .set(&DataKey::ReputationNft, &nft_contract);
     }
 
+    // ── Admin: Key Management (M-of-N Multisig) ───────────────────────────────
+    //
+    // All mutations to the admin set require the current quorum to sign,
+    // preventing a single compromised key from unilaterally modifying governance.
+    //
+    // Key management recommendations:
+    //   - Use hardware wallets (Ledger/Trezor) for each admin key.
+    //   - Store key backups in geographically separate, offline locations.
+    //   - Set admin_threshold to at least ceil(N/2)+1 for N admins (e.g. 3-of-5).
+    //   - Rotate keys periodically using rotate_admin; never reuse compromised keys.
+    //   - After any key rotation, verify the new admin set with get_admins().
+    //   - Never share private keys; each admin should control exactly one key.
+
+    /// Add a new admin to the set. Requires current quorum approval.
+    /// The new admin is appended; threshold is unchanged.
+    pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let mut cfg = Self::config(&env);
+
+        assert!(
+            !cfg.admins.iter().any(|a| a == new_admin),
+            "address is already an admin"
+        );
+
+        cfg.admins.push_back(new_admin.clone());
+        env.storage().instance().set(&DataKey::Config, &cfg);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("added")),
+            new_admin,
+        );
+    }
+
+    /// Remove an existing admin from the set. Requires current quorum approval.
+    /// The threshold must remain satisfiable after removal (threshold <= remaining admins).
+    pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let mut cfg = Self::config(&env);
+
+        let idx = cfg
+            .admins
+            .iter()
+            .position(|a| a == admin_to_remove)
+            .expect("address is not an admin") as u32;
+
+        cfg.admins.remove(idx);
+
+        assert!(
+            !cfg.admins.is_empty(),
+            "cannot remove the last admin"
+        );
+        assert!(
+            cfg.admin_threshold <= cfg.admins.len(),
+            "removal would make threshold unsatisfiable"
+        );
+
+        env.storage().instance().set(&DataKey::Config, &cfg);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("removed")),
+            admin_to_remove,
+        );
+    }
+
+    /// Atomically replace one admin key with another. Requires current quorum approval.
+    /// Use this for key rotation — the threshold is preserved and the admin count stays the same.
+    pub fn rotate_admin(
+        env: Env,
+        admin_signers: Vec<Address>,
+        old_admin: Address,
+        new_admin: Address,
+    ) {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        assert!(old_admin != new_admin, "old and new admin must differ");
+
+        let mut cfg = Self::config(&env);
+
+        assert!(
+            !cfg.admins.iter().any(|a| a == new_admin),
+            "new admin is already in the admin set"
+        );
+
+        let idx = cfg
+            .admins
+            .iter()
+            .position(|a| a == old_admin)
+            .expect("old admin not found") as u32;
+
+        cfg.admins.set(idx, new_admin.clone());
+        env.storage().instance().set(&DataKey::Config, &cfg);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("rotated")),
+            (old_admin, new_admin),
+        );
+    }
+
+    /// Update the quorum threshold. Requires current quorum approval.
+    /// New threshold must be > 0 and <= current admin count.
+    pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold: u32) {
+        Self::require_admin_approval(&env, &admin_signers);
+
+        let mut cfg = Self::config(&env);
+
+        assert!(new_threshold > 0, "threshold must be greater than zero");
+        assert!(
+            new_threshold <= cfg.admins.len(),
+            "threshold cannot exceed admin count"
+        );
+
+        cfg.admin_threshold = new_threshold;
+        env.storage().instance().set(&DataKey::Config, &cfg);
+
+        env.events().publish(
+            (symbol_short!("admin"), symbol_short!("thresh")),
+            new_threshold,
+        );
+    }
+
     // ── Admin: Protocol Fee ───────────────────────────────────────────────────
 
     /// Admin sets the protocol fee applied to interactions (in basis points).
@@ -2847,5 +2969,330 @@ mod tests {
         // voucher_b has never vouched — must succeed immediately despite voucher_a's cooldown
         client.vouch(&voucher_b, &borrower, &1_000_000);
         assert!(client.vouch_exists(&voucher_b, &borrower));
+    }
+
+    // ── Multisig Admin Security Tests ─────────────────────────────────────────
+
+    // --- require_admin_approval enforcement ---
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_admin_op_fails_with_zero_signers() {
+        let env = Env::default();
+        let (contract_id, _, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        // Provide no signers — must fail threshold check
+        client.pause(&Vec::new(&env));
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_admin_op_fails_below_threshold() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        // Only 1 signer for a 2-of-3 contract
+        let signers = address_vec(&env, &[admin_one]);
+        client.pause(&signers);
+    }
+
+    #[test]
+    #[should_panic(expected = "signer is not a registered admin")]
+    fn test_admin_op_fails_with_non_admin_signer() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, _, _, _) = setup_multisig(&env, 1);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let outsider = Address::generate(&env);
+        // outsider is not in the admin set
+        let signers = address_vec(&env, &[admin_one, outsider]);
+        client.pause(&signers);
+    }
+
+    #[test]
+    fn test_admin_op_succeeds_at_exact_threshold() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        client.pause(&signers);
+        assert!(client.get_paused());
+    }
+
+    #[test]
+    fn test_admin_op_succeeds_above_threshold() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        // 3 signers for a 2-of-3 — all three signing is fine
+        let signers = address_vec(&env, &[admin_one, admin_two, admin_three]);
+        client.pause(&signers);
+        assert!(client.get_paused());
+    }
+
+    // --- add_admin ---
+
+    #[test]
+    fn test_add_admin_increases_admin_count() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+
+        let new_admin = Address::generate(&env);
+        assert_eq!(client.get_admins().len(), 3);
+        client.add_admin(&signers, &new_admin);
+        assert_eq!(client.get_admins().len(), 4);
+        assert!(client.get_admins().iter().any(|a| a == new_admin));
+    }
+
+    #[test]
+    #[should_panic(expected = "address is already an admin")]
+    fn test_add_admin_rejects_duplicate() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        // admin_three is already in the set
+        client.add_admin(&signers, &admin_three);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_add_admin_requires_quorum() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let new_admin = Address::generate(&env);
+        // Only 1 signer for a 2-of-3 contract
+        client.add_admin(&address_vec(&env, &[admin_one]), &new_admin);
+    }
+
+    // --- remove_admin ---
+
+    #[test]
+    fn test_remove_admin_decreases_admin_count() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+
+        assert_eq!(client.get_admins().len(), 3);
+        client.remove_admin(&signers, &admin_three);
+        assert_eq!(client.get_admins().len(), 2);
+        assert!(!client.get_admins().iter().any(|a| a == admin_three));
+    }
+
+    #[test]
+    #[should_panic(expected = "removal would make threshold unsatisfiable")]
+    fn test_remove_admin_blocked_when_threshold_would_be_unsatisfiable() {
+        let env = Env::default();
+        // 3-of-3: removing any admin makes threshold unsatisfiable
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 3);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two, admin_three.clone()]);
+        client.remove_admin(&signers, &admin_three);
+    }
+
+    #[test]
+    #[should_panic(expected = "address is not an admin")]
+    fn test_remove_admin_rejects_unknown_address() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        let outsider = Address::generate(&env);
+        client.remove_admin(&signers, &outsider);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_remove_admin_requires_quorum() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        // Only 1 signer for a 2-of-3 contract
+        client.remove_admin(&address_vec(&env, &[admin_one]), &admin_three);
+    }
+
+    // --- rotate_admin ---
+
+    #[test]
+    fn test_rotate_admin_replaces_key_preserves_count() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+
+        let new_key = Address::generate(&env);
+        client.rotate_admin(&signers, &admin_three, &new_key);
+
+        let admins = client.get_admins();
+        assert_eq!(admins.len(), 3);
+        assert!(!admins.iter().any(|a| a == admin_three));
+        assert!(admins.iter().any(|a| a == new_key));
+        // threshold unchanged
+        assert_eq!(client.get_admin_threshold(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "old and new admin must differ")]
+    fn test_rotate_admin_rejects_same_address() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        client.rotate_admin(&signers, &admin_three, &admin_three);
+    }
+
+    #[test]
+    #[should_panic(expected = "new admin is already in the admin set")]
+    fn test_rotate_admin_rejects_existing_admin_as_new() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one.clone(), admin_two]);
+        // admin_one is already in the set — cannot be the "new" key
+        client.rotate_admin(&signers, &admin_three, &admin_one);
+    }
+
+    #[test]
+    #[should_panic(expected = "old admin not found")]
+    fn test_rotate_admin_rejects_unknown_old_admin() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        let outsider = Address::generate(&env);
+        let new_key = Address::generate(&env);
+        client.rotate_admin(&signers, &outsider, &new_key);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_rotate_admin_requires_quorum() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let new_key = Address::generate(&env);
+        client.rotate_admin(&address_vec(&env, &[admin_one]), &admin_three, &new_key);
+    }
+
+    // --- set_admin_threshold ---
+
+    #[test]
+    fn test_set_admin_threshold_updates_value() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+
+        assert_eq!(client.get_admin_threshold(), 2);
+        client.set_admin_threshold(&signers, &3);
+        assert_eq!(client.get_admin_threshold(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold must be greater than zero")]
+    fn test_set_admin_threshold_zero_rejected() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        client.set_admin_threshold(&signers, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "threshold cannot exceed admin count")]
+    fn test_set_admin_threshold_exceeds_admin_count_rejected() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one, admin_two]);
+        // 3 admins, threshold of 4 is impossible
+        client.set_admin_threshold(&signers, &4);
+    }
+
+    #[test]
+    #[should_panic(expected = "insufficient admin approvals")]
+    fn test_set_admin_threshold_requires_quorum() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, _, _, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        client.set_admin_threshold(&address_vec(&env, &[admin_one]), &1);
+    }
+
+    // --- end-to-end key rotation scenario ---
+
+    #[test]
+    fn test_key_rotation_new_admin_can_execute_operations() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one.clone(), admin_two.clone()]);
+
+        // Rotate admin_three out for a fresh key
+        let new_key = Address::generate(&env);
+        client.rotate_admin(&signers, &admin_three, &new_key);
+
+        // New key + admin_one should now satisfy the 2-of-3 threshold
+        let new_signers = address_vec(&env, &[admin_one, new_key]);
+        client.pause(&new_signers);
+        assert!(client.get_paused());
+    }
+
+    #[test]
+    fn test_rotated_out_admin_cannot_execute_operations() {
+        let env = Env::default();
+        let (contract_id, _, admin_one, admin_two, admin_three, _, _) = setup_multisig(&env, 2);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let signers = address_vec(&env, &[admin_one.clone(), admin_two.clone()]);
+
+        let new_key = Address::generate(&env);
+        client.rotate_admin(&signers, &admin_three, &new_key);
+
+        // admin_three is no longer in the set — using it should fail
+        let stale_signers = address_vec(&env, &[admin_one, admin_three]);
+        let result = client.try_pause(&stale_signers);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_admin_config_rejects_empty_admins() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        let result = QuorumCreditContractClient::new(&env, &contract_id)
+            .try_initialize(&admin, &Vec::new(&env), &1, &token_id.address());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_admin_config_rejects_duplicate_admins() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        // Pass the same address twice
+        let dup_admins = address_vec(&env, &[admin.clone(), admin.clone()]);
+        let result = QuorumCreditContractClient::new(&env, &contract_id)
+            .try_initialize(&admin, &dup_admins, &1, &token_id.address());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_admin_config_rejects_threshold_exceeding_admin_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
+        let contract_id = env.register_contract(None, QuorumCreditContract);
+        let admins = address_vec(&env, &[admin.clone()]);
+        // threshold 2 with only 1 admin
+        let result = QuorumCreditContractClient::new(&env, &contract_id)
+            .try_initialize(&admin, &admins, &2, &token_id.address());
+        assert!(result.is_err());
     }
 }
