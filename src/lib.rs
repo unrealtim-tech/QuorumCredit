@@ -2474,6 +2474,65 @@ mod tests {
         assert!(client.get_loan(&borrower).unwrap().repaid);
     }
 
+    #[test]
+    fn test_max_vouchers_configurable_via_set_config() {
+        let env = Env::default();
+        let (contract_id, token_addr, admin, borrower, voucher) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        // Lower the cap to 2
+        let mut cfg = client.get_config();
+        cfg.max_vouchers = 2;
+        client.set_config(&admin_signers, &cfg);
+        assert_eq!(client.get_config().max_vouchers, 2);
+
+        let voucher2 = Address::generate(&env);
+        token_admin.mint(&voucher2, &10_000_000);
+
+        client.vouch(&voucher, &borrower, &1_000_000);
+        client.vouch(&voucher2, &borrower, &1_000_000);
+
+        // Third vouch must be rejected
+        let voucher3 = Address::generate(&env);
+        token_admin.mint(&voucher3, &10_000_000);
+        let result = client.try_vouch(&voucher3, &borrower, &1_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_slash_with_max_vouchers() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (contract_id, token_addr, admin, borrower, _) = setup(&env);
+        let client = QuorumCreditContractClient::new(&env, &contract_id);
+        let token_admin = StellarAssetClient::new(&env, &token_addr);
+        let admin_signers = single_admin_signers(&env, &admin);
+
+        let mut vouchers = soroban_sdk::Vec::new(&env);
+        for _ in 0..DEFAULT_MAX_VOUCHERS {
+            let v = Address::generate(&env);
+            token_admin.mint(&v, &10_000_000);
+            client.vouch(&v, &borrower, &1_000_000);
+            vouchers.push_back(v);
+        }
+
+        client.request_loan(
+            &borrower,
+            &Vec::new(&env),
+            &500_000,
+            &(DEFAULT_MAX_VOUCHERS as i128 * 1_000_000),
+        );
+        client.slash(&admin_signers, &borrower);
+
+        assert!(client.get_loan(&borrower).unwrap().defaulted);
+        // Each voucher had 1_000_000 staked, 50% slashed → 500_000 returned
+        for v in vouchers.iter() {
+            assert_eq!(TokenClient::new(&env, &token_addr).balance(&v), 9_500_000);
+        }
+    }
+
     // ── View Tests ────────────────────────────────────────────────────────────
 
     #[test]
